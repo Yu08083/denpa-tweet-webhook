@@ -1,21 +1,49 @@
+"""
+電波人間 公式X (@denpaningen) の新着ツイートを検知し Discord Webhook へ通知する Bot。
+
+取得手段:
+- 公式 X API は有料なので使わない。
+- Yahoo!リアルタイム検索のバックエンド API
+  (https://search.yahoo.co.jp/realtime/api/v1/pagination) を利用する。
+  認証不要・レート制限なし・User-Agent 偽装のみ必要。
+  参考: https://qiita.com/maebahesioru/items/4fc4e6baf5b96aa84061
+
+設計方針:
+- denpanews-webhook (公式サイト版) と同じ運用フローに揃える:
+  state.json で送信済みツイートIDを管理し、新着のみ Discord に投げる。
+  初回実行は全件を既知化して通知しない。
+- Yahoo の JSON スキーマはフィールド名が一部非公開なので、複数候補キーを
+  総当たりで拾う防御的パーサにしてある。想定外の構造なら DEBUG=1 で
+  生レスポンスの先頭エントリのキー一覧を吐くので、必要なら CANDIDATES を直す。
+
+注意 (Yahoo リアルタイム検索の制約):
+- 日本語ツイート特化。インデックスにはバイアスがあり、エンゲージメントの
+  低いツイートは取りこぼし/遅延する可能性がある (公式 API のような完全性はない)。
+- mtype は付けない。付けると画像なしツイート (テキストのみのお知らせ) が
+  落ちて通知漏れになるため。
+"""
+
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
 
 import requests
 
+# ---------- 設定 ----------
 TWITTER_USERNAME = os.environ.get("TWITTER_USERNAME", "denpaningen")
+# 既定は「特定ユーザーの投稿」演算子。env で上書き可 (例: "@denpaningen" や "電波人間")
 SEARCH_QUERY = os.environ.get("SEARCH_QUERY", f"ID:{TWITTER_USERNAME}")
-RESULTS = int(os.environ.get("RESULTS", "40"))
+RESULTS = int(os.environ.get("RESULTS", "40"))  # 最大40
 
 API_URL = "https://search.yahoo.co.jp/realtime/api/v1/pagination"
 STATE_FILE = Path("state.json")
 WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 DEBUG = os.environ.get("DEBUG") == "1"
 
-EMBED_COLOR = 0x1DA1F2
+EMBED_COLOR = 0x1DA1F2  # Twitter ブルー
 WEBHOOK_NAME = "電波人間 Twitter"
 
 USER_AGENT = (
@@ -24,6 +52,7 @@ USER_AGENT = (
     "Chrome/120.0.0.0 Safari/537.36"
 )
 
+# 防御的パーサ用の候補キー (Yahoo の非公開スキーマ揺れ対策)
 TEXT_KEYS = ["text", "body", "description", "tweet", "content", "message"]
 ID_KEYS = ["id", "tweetId", "statusId", "id_str", "idStr"]
 TIME_KEYS = ["createdAt", "created_at", "time", "date", "timestamp", "postedAt"]
@@ -37,6 +66,7 @@ LIKE_KEYS = ["favoriteCount", "likeCount", "favorites", "likes", "favCount"]
 RT_KEYS = ["retweetCount", "rtCount", "retweets", "shareCount"]
 
 
+# ---------- 小道具 ----------
 def _first_present(d: dict, keys):
     if not isinstance(d, dict):
         return None
@@ -55,6 +85,7 @@ def _find_user_obj(entry: dict):
 
 
 def _deep_find_handle(obj, depth=0):
+    """ネストを潜って screenName 系の値を1つ拾う最終手段。"""
     if depth > 4 or not isinstance(obj, dict):
         return None
     for k in ("screenName", "screen_name", "userScreenName"):
@@ -69,10 +100,12 @@ def _deep_find_handle(obj, depth=0):
     return None
 
 
+# ---------- HTTP ----------
 def fetch_page(start: int = 1, oldest_tweet_id: str = "") -> list:
     params = {
         "p": SEARCH_QUERY,
         "results": str(RESULTS),
+        # md は付けない (= 新着順)。人気順だと新着を取りこぼす。
     }
     if oldest_tweet_id:
         params["oldestTweetId"] = oldest_tweet_id
@@ -101,7 +134,9 @@ def fetch_page(start: int = 1, oldest_tweet_id: str = "") -> list:
     return entries
 
 
+# ---------- パース ----------
 def extract_tweet(entry: dict) -> dict | None:
+    """Yahoo の生エントリを正規化。必須 (id) が取れなければ None。"""
     tid = _first_present(entry, ID_KEYS)
     if tid is None:
         return None
@@ -118,6 +153,7 @@ def extract_tweet(entry: dict) -> dict | None:
         handle = _first_present(user_obj, HANDLE_KEYS)
         name = _first_present(user_obj, NAME_KEYS)
         icon = _first_present(user_obj, ICON_KEYS)
+    # フラット構造 / 取りこぼしフォールバック
     handle = handle or _first_present(entry, ["screenName", "userId", "userScreenName"])
     handle = handle or _deep_find_handle(entry)
     name = name or _first_present(entry, ["userName", "displayName"])
@@ -125,6 +161,7 @@ def extract_tweet(entry: dict) -> dict | None:
     if isinstance(handle, str):
         handle = handle.lstrip("@")
 
+    # メディア (画像/動画サムネ) URL を収集
     media_urls = []
     sensitive = bool(entry.get("possiblySensitive") or entry.get("sensitive"))
     for m in entry.get("media") or []:
@@ -135,6 +172,7 @@ def extract_tweet(entry: dict) -> dict | None:
         if url:
             media_urls.append(url)
 
+    # パーマリンク
     permalink = _first_present(entry, ["permalink", "url", "tweetUrl", "link"])
     if not permalink:
         if handle and tid.isdigit():
@@ -163,6 +201,7 @@ def extract_tweet(entry: dict) -> dict | None:
 
 
 def fetch_tweets() -> list:
+    """@TWITTER_USERNAME の最新ツイートを正規化して返す (新着→古い)。"""
     try:
         entries = fetch_page()
     except requests.RequestException as e:
@@ -178,19 +217,25 @@ def fetch_tweets() -> list:
         t = extract_tweet(entry)
         if not t:
             continue
+        # 投稿者が対象アカウント本人のものだけ通す。
+        # (ID: 演算子でも引用/メンションが混じる可能性に備える)
+        # handle が取れなかったエントリは、クエリが ID: 指定なら本人とみなして通す。
         h = (t["handle"] or "").lower()
         if h:
             if h != target:
                 continue
         else:
             if not SEARCH_QUERY.lower().startswith(("id:", "@")):
+                # キーワード検索時は handle 不明エントリを弾く (誤通知防止)
                 continue
         tweets.append(t)
 
+    # id を数値として降順 (新しい順)。非数値IDは文字列降順にフォールバック。
     def sort_key(t):
         return (1, int(t["id"])) if t["id"].isdigit() else (0, t["id"])
 
     tweets.sort(key=sort_key, reverse=True)
+    # 同一IDの重複除去
     seen = set()
     uniq = []
     for t in tweets:
@@ -201,6 +246,7 @@ def fetch_tweets() -> list:
     return uniq
 
 
+# ---------- 状態管理 ----------
 def load_state():
     if STATE_FILE.exists():
         try:
@@ -218,6 +264,7 @@ def save_state(state):
     )
 
 
+# ---------- Discord ----------
 def post_webhook(payload: dict) -> bool:
     if not WEBHOOK_URL:
         print("DISCORD_WEBHOOK_URL が設定されていません", file=sys.stderr)
@@ -271,6 +318,7 @@ def build_payload(t: dict) -> dict:
     if fields:
         embed["fields"] = fields
 
+    # センシティブ画像は貼らない
     if t["media"] and not t["sensitive"]:
         embed["image"] = {"url": t["media"][0]}
     elif t["media"] and t["sensitive"]:
@@ -285,6 +333,7 @@ def send_tweet(t: dict) -> bool:
     return post_webhook(build_payload(t))
 
 
+# ---------- メイン ----------
 def main():
     state = load_state()
     sent_ids = set(state.get("sent", []))
@@ -292,6 +341,7 @@ def main():
     tweets = fetch_tweets()
     if not tweets:
         print("ツイートが1件も取得できませんでした", file=sys.stderr)
+        # 取得ゼロは「新着なし」ではなく取得失敗の可能性が高いので state は触らず終了
         sys.exit(1)
 
     print(f"取得ツイート件数: {len(tweets)} (@{TWITTER_USERNAME})")
@@ -304,6 +354,7 @@ def main():
         for t in new_tweets:
             sent_ids.add(t["id"])
     else:
+        # 古い→新しい順で通知
         for t in reversed(new_tweets):
             preview = (t["text"] or "").replace("\n", " ")[:40]
             print(f"新規ツイート: {t['id']} {preview}")
@@ -311,6 +362,7 @@ def main():
                 sent_ids.add(t["id"])
                 time.sleep(1.0)
 
+    # state が肥大化しないよう、最近の数百件だけ保持 (数値ID降順)
     def k(x):
         return (1, int(x)) if str(x).isdigit() else (0, str(x))
 

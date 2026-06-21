@@ -24,7 +24,7 @@ GET https://search.yahoo.co.jp/realtime/api/v1/pagination?p=ID:denpaningen&resul
 - `ID:denpaningen` で @denpaningen の最新ツイートを取得
 - 新着があれば Discord に 本文 + 画像 + いいね/RT数 + ツイートリンク を送信
 - 投稿者が本人のエントリだけ通す(引用・メンション混入を除外)
-- 集中監視時間帯は1分間隔でチェック (JST 10:59-11:02 は4回 / JST 14:55-15:15 は21回・広め)
+- 集中監視時間帯 (JST 10:59-11:02 / 14:59-15:02) は1分間隔で4回チェック
 - 通常時間帯は毎時14分(JST)に1回チェック
 - 状態は `state.json` で管理(送信済みツイートID、直近500件保持)、GitHub Actions が自動コミット
 
