@@ -1,0 +1,79 @@
+name: Check Denpa Tweets
+
+on:
+  schedule:
+    - cron: '5 * * * *'
+    - cron: '57 1 * * *'
+    - cron: '52 5 * * *'
+  workflow_dispatch:
+    inputs:
+      intensive:
+        description: '集中監視モード(1分間隔)'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: denpa-tweet-bot
+  cancel-in-progress: false
+
+jobs:
+  check-tweets:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Determine intensive mode
+        id: mode
+        run: |
+          if [ "${{ inputs.intensive }}" = "true" ]; then
+            echo "intensive=1" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event.schedule }}" = "57 1 * * *" ] \
+            || [ "${{ github.event.schedule }}" = "52 5 * * *" ]; then
+            echo "intensive=1" >> $GITHUB_OUTPUT
+          else
+            echo "intensive=0" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run runner
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          TWITTER_USERNAME: denpaningen
+          INTENSIVE: ${{ steps.mode.outputs.intensive }}
+          TZ: Asia/Tokyo
+        run: python runner.py
+
+      - name: Commit state if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git pull --rebase origin ${{ github.ref_name }} || true
+
+          if [ -n "$(git status --porcelain)" ]; then
+            git add state.json
+            git commit -m "Update tweet state [skip ci]"
+            for i in 1 2 3; do
+              git pull --rebase origin ${{ github.ref_name }} && \
+                git push && break || sleep 5
+            done
+          else
+            echo "No changes"
+          fi
