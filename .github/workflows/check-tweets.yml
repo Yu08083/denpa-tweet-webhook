@@ -3,7 +3,7 @@ name: Check Denpa Tweets
 on:
   schedule:
     - cron: '5 * * * *'
-    - cron: '57 1 * * *'
+    - cron: '52 1 * * *'
     - cron: '52 5 * * *'
   workflow_dispatch:
     inputs:
@@ -46,7 +46,7 @@ jobs:
         run: |
           if [ "${{ inputs.intensive }}" = "true" ]; then
             echo "intensive=1" >> $GITHUB_OUTPUT
-          elif [ "${{ github.event.schedule }}" = "57 1 * * *" ] \
+          elif [ "${{ github.event.schedule }}" = "52 1 * * *" ] \
             || [ "${{ github.event.schedule }}" = "52 5 * * *" ]; then
             echo "intensive=1" >> $GITHUB_OUTPUT
           else
