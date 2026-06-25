@@ -9,6 +9,9 @@ import requests
 
 JST = timezone(timedelta(hours=9))
 
+# Twitter snowflake のエポック(2010-11-04 01:42:54.657 UTC)
+TWITTER_EPOCH_MS = 1288834974657
+
 TWITTER_USERNAME = os.environ.get("TWITTER_USERNAME", "denpaningen")
 SEARCH_QUERY = os.environ.get("SEARCH_QUERY", f"ID:{TWITTER_USERNAME}")
 RESULTS = int(os.environ.get("RESULTS", "40"))
@@ -17,6 +20,9 @@ API_URL = "https://search.yahoo.co.jp/realtime/api/v1/pagination"
 STATE_FILE = Path("state.json")
 WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 DEBUG = os.environ.get("DEBUG") == "1"
+
+# 投稿時刻と送信時刻がこれ以上離れていたら送らない(保険)。0以下で無効化。
+MAX_AGE_MINUTES = int(os.environ.get("MAX_AGE_MINUTES", "360"))
 
 EMBED_COLOR = 0x1DA1F2
 WEBHOOK_NAME = "電波人間 Twitter"
@@ -91,6 +97,23 @@ def _extract_text(entry: dict) -> str:
             if joined:
                 return joined
     return ""
+
+
+def _post_epoch(tid: str, raw_created) -> float | None:
+    """投稿時刻を Unix 秒で返す。ID(Snowflake)を最優先、なければ createdAt。"""
+    # ツイートID自体が投稿時刻を内包しているので最も信頼できる
+    if tid and tid.isdigit():
+        n = int(tid)
+        if n > (1 << 22):  # 正規の snowflake かどうかの簡易ガード
+            return ((n >> 22) + TWITTER_EPOCH_MS) / 1000.0
+    # フォールバック: API の createdAt(Unix 秒 or ミリ秒)
+    s = str(raw_created).strip()
+    if s.isdigit():
+        v = int(s)
+        if v > 10_000_000_000:  # ミリ秒
+            v //= 1000
+        return float(v)
+    return None
 
 
 def _format_time(raw) -> str:
@@ -192,6 +215,7 @@ def extract_tweet(entry: dict) -> dict | None:
         "id": tid,
         "text": text,
         "created": _format_time(created),
+        "created_epoch": _post_epoch(tid, created),
         "handle": handle or "",
         "name": name or (handle or TWITTER_USERNAME),
         "icon": icon or "",
@@ -345,8 +369,20 @@ def main():
         for t in new_tweets:
             sent_ids.add(t["id"])
     else:
+        now_ts = datetime.now(JST).timestamp()
         for t in reversed(new_tweets):
             preview = (t["text"] or "").replace("\n", " ")[:40]
+
+            epoch = t.get("created_epoch")
+            if MAX_AGE_MINUTES > 0 and epoch is not None:
+                age_min = (now_ts - epoch) / 60.0
+                if age_min > MAX_AGE_MINUTES:
+                    posted = datetime.fromtimestamp(epoch, JST).strftime("%Y/%m/%d %H:%M")
+                    print(f"古い投稿のためスキップ: {t['id']} "
+                          f"(投稿 {posted} / 約{age_min / 60:.1f}時間前) → 既知化のみ")
+                    sent_ids.add(t["id"])
+                    continue
+
             print(f"新規ツイート: {t['id']} {preview}")
             if send_tweet(t):
                 sent_ids.add(t["id"])
